@@ -1,0 +1,155 @@
+#!/bin/bash
+
+usage() {
+  echo "Usage: raid5 [ -d1 disk1 ] [ -d2 disk2 ] [ -d3 disk3 ] mountpoint"
+  exit 2
+}
+
+# Utility function to generate cleanup script iteratively throughout the script
+# Allows script to fail anywhere and clean up all successful steps
+CLEANUP=""
+cleanup_add() {
+    CLEANUP=$(cat <<-END
+	$1
+	$CLEANUP
+END
+)
+}
+
+fail() {
+    echo $1
+    echo
+    echo "Running cleanup and exiting..."
+    eval "${CLEANUP}"
+    exit 2
+}
+
+
+# Parse args
+PARSED_ARGUMENTS=$(getopt -a -n raid5 -o "h" --long help,d1:,d2:,d3: -- "$@")
+VALID_ARGUMENTS=$?
+if [ "$VALID_ARGUMENTS" != "0" ]; then
+  usage
+fi
+
+eval set -- "$PARSED_ARGUMENTS"
+while :
+do
+  case "$1" in
+    -h | --help) usage ;;
+    --d1) DISK1="$2" ; shift 2 ;;
+    --d2) DISK2="$2" ; shift 2 ;;
+    --d3) DISK3="$2" ; shift 2 ;;
+    # End of the arguments
+    --) shift; break ;;
+    # Should never be reached, getopt would have reported an error by now
+    *) echo "Unexpected option: $1 - this should not happen."
+       usage ;;
+  esac
+done
+
+# Check at least two disks are provided
+DISKS=($DISK1 $DISK2 $DISK3)
+NDISKS=${#DISKS[@]}
+if [ $NDISKS -lt 2 ]; then
+    echo "RAID 5 requires at least 2 disks but you only provided $NDISKS:"
+    echo "DISK1: $DISK1"
+    echo "DISK2: $DISK2"
+    echo "DISK3: $DISK3"
+    exit 2
+fi
+
+# Check mountpoint is provided
+MOUNTPOINT=$1; shift 1
+if [ -z "$MOUNTPOINT" ]; then
+    echo "No mountpoint provided."
+    usage
+fi
+
+# Check no arguments remain
+if [ "$@" ]; then
+    echo "Too many arguments provided: $@"
+    usage
+fi
+
+
+# Check all disks are valid files
+for i in "${!DISKS[@]}"; do
+    if [ "${DISKS[$i]}" ] && [ ! -f "${DISKS[$i]}" ]; then
+        echo "DISK$((i + 1)) is not a valid disk file: ${DISKS[$i]}"
+        exit 2
+    fi
+done
+
+# Create mountpoint if it does not exist (if possible)
+if [ ! -d "$MOUNTPOINT" ]; then
+    echo "Creating directory $MOUNTPOINT..."
+    if [ -e "$MOUNTPOINT" ]; then
+        fail "Mountpoint $MOUNTPOINT already exists but is not a directory"
+    fi
+    mkdir $MOUNTPOINT
+    cleanup_add "rm -rf $MOUNTPOINT"
+    cleanup_add "echo 'Removing created mountpoint directory $MOUNTPOINT'"
+fi
+
+
+# Setup loop devices
+for i in "${!DISKS[@]}"; do
+    if [ "${DISKS[$i]}" ]; then
+        LOOP=$(sudo losetup -f)
+        echo "Setting up loop device for DISK$((i + 1)) at $LOOP..."
+        sudo losetup -P $LOOP "${DISKS[$i]}"
+        if [ $? -ne 0 ]; then
+            fail "Loop device for DISK$((i + 1)) could not be setup."
+        fi
+        cleanup_add "sudo losetup -d $LOOP"
+        cleanup_add "echo 'Detaching loop device $LOOP...'"
+
+        # Device path is needed by mdadm - create variable name dynamically
+        declare LOOP$((i + 1))=$LOOP
+    fi
+done
+
+# Find first available /dev/mdX file
+RAIDPATH="/dev/md"
+i=0
+while [ -e "$RAIDPATH$i" ]; do
+    i=$[$i + 1]
+done
+RAIDPATH="$RAIDPATH$i"
+
+# Create RAID 5 array with mdadm
+echo "Creating RAID 5 array at $RAIDPATH"
+yes | sudo mdadm --create $RAIDPATH --level=5 --raid-devices=3 ${LOOP1:-missing} ${LOOP2:-missing} ${LOOP3:-missing}
+if [ $? -ne 0 ]; then
+    fail "RAID 5 array could not be created."
+fi
+cleanup_add "sudo mdadm --stop $RAIDPATH"
+cleanup_add "echo 'Removing RAID 5 array at $RAIDPATH...'"
+
+# Mount resulting array drive at provided mountpoint
+echo "Mounting RAID 5 array drive at $MOUNTPOINT..."
+sudo mount -t ext4 $RAIDPATH $MOUNTPOINT
+if [ $? -ne 0 ]; then
+    fail "Drive could not be mounted."
+fi
+cleanup_add "sudo umount $MOUNTPOINT"
+cleanup_add "echo 'Unmounting $MOUNTPOINT...'"
+
+
+echo "Drive mounted successfully!"
+echo
+
+
+# Generate local cleanup script if possible, else output cleanup commands
+if [ ! -e "cleanup.sh" ]; then
+    echo "When done, please run the generated cleanup script ./cleanup.sh"
+    cleanup_add "#!/bin/bash"
+    echo "$CLEANUP" > cleanup.sh
+    echo "echo 'Removing cleanup script...'" >> cleanup.sh
+    echo "rm cleanup.sh" >> cleanup.sh
+    chmod +x cleanup.sh
+else
+    echo "When done, please run the following cleanup commands:"
+    echo "$CLEANUP" | grep -v "echo"
+fi
