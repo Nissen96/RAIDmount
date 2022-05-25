@@ -1,0 +1,287 @@
+#!/bin/bash
+
+usage() {
+  echo "Usage: $(basename $0) [-h | --help] (-l <n> | --level <n>) (-m <dir> | --mount <dir>) <disk>...
+
+Options:
+  -l, --level <n>    RAID level: 0,1,4,5,6,10
+  -m, --mount <dir>  Mountpoint for RAID array
+  -h, --help         Show extended help menu"
+  
+  exit 2
+}
+
+help() {
+    echo "RAIDmount
+Usage: $(basename $0) [-h | --help] (-l <n> | --level <n>) (-m <dir> | --mount <dir>) <disk>...
+
+Options:
+  -l, --level <n>    RAID level: 0,1,4,5,6,10
+  -m, --mount <dir>  Mountpoint for RAID array
+  -h, --help         Show this help menu
+
+
+Each RAID level requires a minimum amount of disks and has a max disk fault tolerance:
+    +-------+-------+---------+
+    | level | disks | faults  |
+    +-------+-------+---------+
+    |   0   |   2+  |    0    |
+    |   1   |   2+  |  n - 1  |
+    |   4   |   3+  |    1    |
+    |   5   |   3+  |    1    |
+    |   6   |   4+  |    2    |
+    |  10   |   4+  |  n / 2  |
+    +-------+-------+---------+
+(Note: RAID level 10 (1+0) requires an even number of disks
+and can tolerate at most one disk failure per mirrored pair.)
+
+Use 'missing' to denote a disk as corrupt or missing, e.g.
+  $(basename $0) -l 6 -m raid disk1.img missing disk3.img missing
+
+Mountpoint will be created if it does not exist.
+If it exists but is not a directory, the program will exit.
+
+At the end, a cleanup script is generated to run when done with the mounted disk.
+
+
+Examples:
+  $(basename $0) -l 1 -m raid1 missing disk2.img missing missing
+  $(basename $0) --level=5 --mount raid5 disk3.img missing disk2.img
+  $(basename $0) -l 10 -m raid10 disk1 missing missing disk4 disk5 disk6
+
+
+Failure examples:
+  $(basename $0) -l 0 -m raid0 missing disk2.img
+    RAID 0 has no fault tolerance
+
+  $(basename $0) -l 4 -m raid4 disk1 missing missing
+    RAID 4 tolerates at most one disk failure
+
+  $(basename $0) -l 6 -m raid6 disk1 disk2 disk3
+    RAID 6 requires at least four disks
+
+  $(basename $0) -l 10 -m raid10 disk1 disk2 disk3 disk4 disk5
+    RAID 1+0 requires an even number of disks
+
+  $(basename $0) -l 10 -m raid10 disk1 disk2 missing missing
+    RAID 1+0 tolerates at most one disk failure per mirrored pair"
+  exit 0
+}
+
+# Utility function to generate cleanup script iteratively throughout the script
+# Allows script to fail anywhere and clean up all successful steps
+CLEANUP=""
+cleanup_add() {
+    CLEANUP=$(cat <<-END
+	$1
+	$CLEANUP
+END
+)
+}
+
+err() {
+    echo "Error: $1"
+}
+
+fail() {
+    err "$1"
+    echo "Running cleanup and exiting..."
+    eval "${CLEANUP}"
+    exit 2
+}
+
+printnum() {
+    declare -A nums=( [0]=zero [1]=one [2]=two [3]=three [4]=four [5]=five [6]=six [7]=seven [8]=eight [9]=nine [10]=ten [11]=eleven )
+    if [ ${nums[$1]} ]; then
+        echo ${nums[$1]}
+    else
+        echo $1
+    fi
+}
+
+
+# Parse args
+PARSED_ARGUMENTS=$(getopt -a -n $(basename $0) -o "hl:m:" --long help,level:,mount: -- "$@")
+VALID_ARGUMENTS=$?
+if [ "$VALID_ARGUMENTS" != "0" ]; then
+  usage
+fi
+
+eval set -- "$PARSED_ARGUMENTS"
+while :
+do
+  case "$1" in
+    -h | --help)                    help    ;;
+    -l | --level) LEVEL="$2"      ; shift 2 ;;
+    -m | --mount) MOUNTPOINT="$2" ; shift 2 ;;
+    # End of the arguments
+    --) shift; break ;;
+    # Should never be reached, getopt would have reported an error by now
+    *) echo "Unexpected option: $1 - this should not happen."
+       usage ;;
+  esac
+done
+
+DISKS=( "$@" )  # Remaining args are disks
+
+
+# Check mountpoint is provided
+if [ -z "$MOUNTPOINT" ]; then
+    err "No mountpoint provided."
+    usage
+fi
+
+# Check provided RAID level is valid
+VALID_LEVELS=("0" "1" "4" "5" "6" "10")
+if [[ ! " ${VALID_LEVELS[*]} " =~ " ${LEVEL} " ]]; then
+    err "$LEVEL is not an accepted RAID level."
+    usage
+fi
+
+
+# Check minimum disk requirements
+NDISKS=${#DISKS[@]}
+declare -A MIN_DISKS=( [0]=2 [1]=2 [4]=3 [5]=3 [6]=4 [10]=4 )
+if [ $NDISKS -lt ${MIN_DISKS[$LEVEL]} ]; then
+    err "RAID $LEVEL requires at least $(printnum ${MIN_DISKS[$LEVEL]}) disks but you only provided $(printnum $NDISKS):"
+    for i in "${!DISKS[@]}"; do
+        echo "  DISK$((i + 1)): ${DISKS[$i]}"
+    done
+    echo -e "\nTo see disk requirements, run $(basename $0) -h"
+    exit 2
+fi
+
+# RAID 1+0 requires an even number of disks
+if [[ $LEVEL -eq 10 && $((NDISKS % 2)) -eq 1 ]]; then
+    err "RAID 1+0 requires an even number of disks but you provided $(printnum $NDISKS):"
+    for i in "${!DISKS[@]}"; do
+        echo "  DISK$((i + 1)): ${DISKS[$i]}"
+    done
+    echo -e "\nTo see disk requirements, run $(basename $0) -h"
+    exit 2
+fi
+
+# Check maximum fault tolerance requirements
+NFAULTS=$(for word in ${DISKS[*]}; do echo $word; done | grep -c "^missing$")
+declare MAX_FAULTS=( [0]=0 [1]=$((NDISKS - 1)) [4]=1 [5]=1 [6]=2 [10]=$((NDISKS / 2)) )
+if [ $NFAULTS -gt ${MAX_FAULTS[$LEVEL]} ]; then
+    fault_word=$([ "${MAX_FAULTS[$LEVEL]}" -eq 1 ] && echo "fault" || echo "faults")
+    if [ $LEVEL -eq 0 ]; then
+        err "RAID 0 has no disk fault tolerance but you declared $(printnum $NFAULTS) missing:"
+    elif [[ $LEVEL -eq 1 || $LEVEL -eq 10 ]]; then
+        err "RAID $LEVEL tolerates at most $(printnum ${MAX_FAULTS[$LEVEL]}) $fault_word for $(printnum $NDISKS) disks but you declared $(printnum $NFAULTS) missing:"
+    else
+        err "RAID $LEVEL tolerates at most $(printnum ${MAX_FAULTS[$LEVEL]}) $fault_word but you declared $(printnum $NFAULTS) missing:"
+    fi
+    for i in "${!DISKS[@]}"; do
+        if [[ "${DISKS[$i]}" = "missing" ]]; then
+            echo "  DISK$((i + 1)): ${DISKS[$i]}"
+        fi
+    done
+    echo -e "\nTo see disk requirements, run $(basename $0) -h"
+    exit 2
+fi
+
+# Check specific fault tolerance for RAID 1+0 (one per mirrored pair)
+if [ $LEVEL -eq 10 ]; then
+    for ((i=0; i<$NDISKS; i+=2)); do
+        if [[ "${DISKS[$i]}" = "missing" && "${DISKS[$((i + 1))]}" = "missing" ]]; then
+            err "RAID 1+0 tolerates at most one missing disk per mirrored pair but you provided a pair with both disks missing:
+DISK$((i + 1)): ${DISKS[$i]}
+DISK$((i + 2)): ${DISKS[$((i + 1))]}
+
+To see disk requirements, run $(basename $0) -h"
+            exit 2
+        fi
+    done
+fi
+
+# Check all disks are valid files (or declared missing)
+for i in "${!DISKS[@]}"; do
+    disk="${DISKS[$i]}"
+    if [[ ! ("$disk" = "missing" || -f "${DISKS[$i]}") ]]; then
+        err "DISK$((i + 1)) is not a valid disk file: ${DISKS[$i]}"
+        exit 2
+    fi
+done
+
+
+
+# Create mountpoint if it does not exist (if possible)
+if [ ! -d "$MOUNTPOINT" ]; then
+    echo "Creating directory $MOUNTPOINT..."
+    if [ -e "$MOUNTPOINT" ]; then
+        err "Mountpoint $MOUNTPOINT already exists but is not a directory"
+        exit 2
+    fi
+    mkdir $MOUNTPOINT
+    cleanup_add "rm -rf $MOUNTPOINT"
+    cleanup_add "echo 'Removing created mountpoint directory $MOUNTPOINT'"
+fi
+
+
+# Setup loop devices
+LOOP_DEVICES=()
+for i in "${!DISKS[@]}"; do
+    if [ "${DISKS[$i]}" = "missing" ]; then
+        LOOP_DEVICES+=( "missing" )
+        continue
+    fi
+
+    LOOP=$(sudo losetup -f)
+    echo "Setting up loop device for DISK$((i + 1)) at $LOOP..."
+    sudo losetup -P $LOOP "${DISKS[$i]}"
+    if [ $? -ne 0 ]; then
+        fail "Loop device for DISK$((i + 1)) could not be setup."
+    fi
+    cleanup_add "sudo losetup -d $LOOP"
+    cleanup_add "echo 'Detaching loop device $LOOP...'"
+
+    LOOP_DEVICES+=( "$LOOP" )
+done
+
+
+# Find first available /dev/mdX file for RAID array
+RAIDPATH="/dev/md"
+i=0
+while [ -e "$RAIDPATH$i" ]; do
+    i=$[$i + 1]
+done
+RAIDPATH="$RAIDPATH$i"
+
+
+# Create RAID array with mdadm
+echo "Creating RAID $LEVEL array at $RAIDPATH"
+sudo mdadm --create $RAIDPATH --level=$LEVEL --raid-devices=$NDISKS ${LOOP_DEVICES[@]}
+if [ $? -ne 0 ]; then
+    fail "RAID $LEVEL array could not be created."
+fi
+cleanup_add "sudo mdadm --stop $RAIDPATH"
+cleanup_add "echo 'Removing RAID $LEVEL array at $RAIDPATH...'"
+
+
+# Mount resulting array drive at provided mountpoint
+echo "Mounting RAID $LEVEL array drive at $MOUNTPOINT..."
+sudo mount $RAIDPATH $MOUNTPOINT
+if [ $? -ne 0 ]; then
+    fail "Drive could not be mounted."
+fi
+cleanup_add "sudo umount $MOUNTPOINT"
+cleanup_add "echo 'Unmounting $MOUNTPOINT...'"
+
+
+echo -e "Drive mounted successfully!\n"
+
+
+# Generate local cleanup script if possible, else output cleanup commands
+if [ ! -e "cleanup.sh" ]; then
+    echo "When done, please run the generated cleanup script ./cleanup.sh"
+    cleanup_add "#!/bin/bash"
+    echo "$CLEANUP" > cleanup.sh
+    echo "echo 'Removing cleanup script...'" >> cleanup.sh
+    echo "rm cleanup.sh" >> cleanup.sh
+    chmod +x cleanup.sh
+else
+    echo "When done, please run the following cleanup commands:"
+    echo "$CLEANUP" | grep -v "echo"
+fi
